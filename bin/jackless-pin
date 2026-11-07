@@ -1,0 +1,615 @@
+#!/bin/bash
+# jackless-pin: root helper that mutes or unmutes the speaker pins of an HDA codec.
+# Runs as root through a NOPASSWD sudo rule: self-contained, nothing is sourced,
+# every config and state value is validated before use.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export HOME=/root
+unset XDG_CONFIG_HOME ALSA_CONFIG_PATH
+
+readonly CONFIG_FILE=/etc/jackless.conf
+readonly STATE_FILE=/run/jackless.state
+readonly LOCK_FILE=/run/jackless.lock
+readonly POWER_SAVE_FILE=/sys/module/snd_hda_intel/parameters/power_save
+readonly PIN_ENABLED_VALUE=0x40
+readonly PIN_MUTED_VALUE=0x00
+readonly PIN_OUT_ENABLE_BIT=0x40
+readonly POWER_SAVE_DISABLED=0
+readonly RESTORE_ATTEMPTS=5
+readonly RESTORE_DELAY_SECONDS=0.5
+readonly HDA_VERB_TIMEOUT_SECONDS=5
+readonly LOCK_TIMEOUT_SECONDS=10
+readonly ALSACTL_GENERIC_INIT_CODE=99
+readonly EXIT_USAGE=2
+
+readonly CARD_PATTERN='^[A-Za-z0-9_]+$'
+readonly DEVICE_PATTERN='^/dev/snd/hwC[0-9]+D[0-9]+$'
+readonly PINS_PATTERN='^0x[0-9a-fA-F]{1,2}( 0x[0-9a-fA-F]{1,2})*$'
+readonly CONTROL_PATTERN='^[A-Za-z0-9 _-]+$'
+readonly SINK_PATTERN='^[A-Za-z0-9._:-]*$'
+readonly NOTIFY_PATTERN='^[01]$'
+readonly INTEGER_PATTERN='^-?[0-9]+$'
+readonly PIN_VALUE_PATTERN='^0x[0-9a-fA-F]{1,2}$'
+readonly STATE_PIN_KEY_PATTERN='^PIN_0x[0-9a-f]{1,2}$'
+
+# shellcheck disable=SC2016
+readonly CODEC_AWK_PROGRAM='
+function append(node_id) {
+  list = (list == "" ? node_id : list " " node_id)
+}
+function has_out_bit(hex,    digits, high) {
+  sub(/:$/, "", hex)
+  digits = substr(hex, 3)
+  if (length(digits) < 2) return 0
+  high = tolower(substr(digits, length(digits) - 1, 1))
+  return (index("4567cdef", high) > 0)
+}
+function flush(    is_auto, is_hint) {
+  if (!in_pin) return
+  is_auto = (pin_default ~ /Speaker/ && pin_default !~ /\[N\/A\]/) || has_speaker_control
+  is_hint = (!is_auto && pin_default ~ /\[N\/A\]/ && wcaps ~ /Amp-Out/ && wcaps !~ /Digital/ && out_enabled)
+  if (kind == "auto" && is_auto) append(node)
+  if (kind == "hints" && is_hint) append(node)
+  in_pin = 0
+}
+/^Node 0x[0-9a-fA-F][0-9a-fA-F]? / {
+  flush()
+  if ($0 ~ /\[Pin Complex\]/) {
+    in_pin = 1
+    node = $2
+    wcaps = $0
+    pin_default = ""
+    has_speaker_control = 0
+    out_enabled = 0
+  }
+  next
+}
+in_pin && /^[ \t]*Pin Default / { pin_default = $0 }
+in_pin && /^[ \t]*Control: name="[^"]*Speaker Playback/ { has_speaker_control = 1 }
+in_pin && /^[ \t]*Pin-ctls: / { out_enabled = has_out_bit($2) }
+END { flush(); print list }
+'
+
+CARD=PCH
+DEVICE=""
+SPEAKER_PINS=""
+HEADPHONE_CONTROL=Headphone
+CARD_INDEX=""
+DEVICE_PATH=""
+CODEC_FILE=""
+PINS_SOURCE=""
+PINS_AUTO=""
+PINS_HINT=""
+declare -a PINS=()
+declare -a PIN_VALUES=()
+declare -A STATE=()
+
+print_usage() {
+  cat <<'USAGE'
+Usage : jackless-pin <verbe>
+
+Verbes (root requis, sauf help et detect) :
+  on          réactive les haut-parleurs
+  off         coupe les haut-parleurs (mode casque)
+  toggle      bascule entre les deux modes
+  status      affiche l'état (clé=valeur)
+  restore     ré-applique le mode casque (après veille ou redémarrage audio)
+  alsa-init   initialise la carte ALSA puis ré-applique le mode casque
+  detect FILE analyse un fichier codec (sans root)
+  --help      affiche cette aide
+USAGE
+}
+
+print_error() {
+  printf 'jackless-pin: %s\n' "$*" >&2
+}
+
+die() {
+  print_error "$@"
+  exit 1
+}
+
+exit_usage() {
+  print_usage >&2
+  exit "$EXIT_USAGE"
+}
+
+log_message() {
+  local priority=$1 message=$2
+  command -v logger >/dev/null 2>&1 || return 0
+  logger -t jackless -p "user.$priority" -- "$message" || true
+}
+
+require_root() {
+  (( EUID == 0 )) || die "doit être exécuté en root (utilise sudo)"
+}
+
+validate_pattern() {
+  local key=$1 value=$2 pattern=$3
+  [[ $value =~ $pattern ]] || die "valeur invalide pour $key dans $CONFIG_FILE : $value"
+}
+
+assign_config() {
+  local key=$1 value=$2
+  case "$key" in
+    CARD) validate_pattern "$key" "$value" "$CARD_PATTERN"; CARD=$value ;;
+    DEVICE) validate_device "$value" ;;
+    SPEAKER_PINS) validate_pins "$value" ;;
+    HEADPHONE_CONTROL) validate_pattern "$key" "$value" "$CONTROL_PATTERN"; HEADPHONE_CONTROL=$value ;;
+    SINK) validate_pattern "$key" "$value" "$SINK_PATTERN" ;;
+    NOTIFY) validate_pattern "$key" "$value" "$NOTIFY_PATTERN" ;;
+    *) print_error "clé inconnue ignorée dans $CONFIG_FILE : $key" ;;
+  esac
+}
+
+validate_device() {
+  local value=$1
+  if [[ -n $value ]]; then
+    validate_pattern DEVICE "$value" "$DEVICE_PATTERN"
+  fi
+  DEVICE=$value
+}
+
+validate_pins() {
+  local value=$1
+  if [[ -n $value ]]; then
+    validate_pattern SPEAKER_PINS "$value" "$PINS_PATTERN"
+  fi
+  SPEAKER_PINS=$value
+}
+
+trim_line() {
+  local line=$1
+  line=${line#"${line%%[![:space:]]*}"}
+  line=${line%"${line##*[![:space:]]}"}
+  printf '%s' "$line"
+}
+
+parse_config_line() {
+  local line
+  line=$(trim_line "$1")
+  if [[ -z $line || $line == \#* ]]; then
+    return 0
+  fi
+  [[ $line =~ ^([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || die "ligne invalide dans $CONFIG_FILE : $line"
+  local key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+  if [[ $value =~ ^\"(.*)\"$ ]]; then
+    value=${BASH_REMATCH[1]}
+  fi
+  assign_config "$key" "$value"
+}
+
+load_config() {
+  [[ -e $CONFIG_FILE ]] || return 0
+  [[ -r $CONFIG_FILE ]] || die "fichier de configuration illisible : $CONFIG_FILE"
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    parse_config_line "$line"
+  done < "$CONFIG_FILE"
+}
+
+is_valid_state_entry() {
+  local key=$1 value=$2
+  case "$key" in
+    MODE) [[ $value == headphones || $value == speakers ]] ;;
+    POWER_SAVE) [[ $value =~ $INTEGER_PATTERN ]] ;;
+    PIN_0x*) [[ $key =~ $STATE_PIN_KEY_PATTERN && $value =~ $PIN_VALUE_PATTERN ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+store_state_line() {
+  local line=$1
+  [[ $line =~ ^([A-Za-z0-9_]+)=(.*)$ ]] || return 0
+  local key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+  if is_valid_state_entry "$key" "$value"; then
+    STATE[$key]=$value
+    return 0
+  fi
+  log_message warning "entrée d'état ignorée : $key"
+}
+
+load_state() {
+  STATE=()
+  [[ -f $STATE_FILE ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    store_state_line "$line"
+  done < "$STATE_FILE"
+}
+
+write_state() {
+  local temp_file key
+  temp_file=$(mktemp -- "$STATE_FILE.XXXXXX") || return 1
+  while IFS= read -r key; do
+    [[ -n $key ]] || continue
+    printf '%s=%s\n' "$key" "${STATE[$key]}"
+  done < <(printf '%s\n' "${!STATE[@]}" | sort) > "$temp_file"
+  chmod 600 -- "$temp_file" || return 1
+  mv -f -- "$temp_file" "$STATE_FILE" || { rm -f -- "$temp_file"; return 1; }
+}
+
+acquire_lock() {
+  local lock_descriptor
+  exec {lock_descriptor}>"$LOCK_FILE" || die "verrou impossible à ouvrir : $LOCK_FILE"
+  flock --timeout "$LOCK_TIMEOUT_SECONDS" "$lock_descriptor" || die "verrou occupé : $LOCK_FILE"
+}
+
+run_locked() {
+  acquire_lock
+  "$@"
+}
+
+list_codec_pins() {
+  local file=$1 kind=$2
+  awk -v kind="$kind" -- "$CODEC_AWK_PROGRAM" "$file"
+}
+
+read_codec_name() {
+  awk -F': ' '/^Codec:/ { print $2; exit }' -- "$CODEC_FILE"
+}
+
+resolve_card_index() {
+  if [[ $CARD =~ ^[0-9]+$ ]]; then
+    CARD_INDEX=$CARD
+    return 0
+  fi
+  local link
+  link=$(readlink -- "/proc/asound/$CARD") || { print_error "carte audio introuvable : $CARD"; return 1; }
+  [[ $link =~ ^card([0-9]+)$ ]] || { print_error "lien de carte inattendu : $link"; return 1; }
+  CARD_INDEX=${BASH_REMATCH[1]}
+}
+
+use_configured_device() {
+  [[ $DEVICE =~ ^/dev/snd/hwC([0-9]+)D([0-9]+)$ ]] || { print_error "périphérique invalide : $DEVICE"; return 1; }
+  local device_card=${BASH_REMATCH[1]} codec_address=${BASH_REMATCH[2]}
+  if (( 10#$device_card != 10#$CARD_INDEX )); then
+    print_error "$DEVICE n'appartient pas à la carte $CARD (index $CARD_INDEX)"
+    return 1
+  fi
+  DEVICE_PATH=$DEVICE
+  CODEC_FILE="/proc/asound/card${CARD_INDEX}/codec#${codec_address}"
+  [[ -r $CODEC_FILE ]] || { print_error "fichier codec illisible : $CODEC_FILE"; return 1; }
+}
+
+detect_codec_device() {
+  local file codec_address
+  for file in "/proc/asound/card${CARD_INDEX}"/codec#*; do
+    [[ -r $file ]] || continue
+    codec_address=${file##*codec#}
+    [[ $codec_address =~ ^[0-9]+$ ]] || continue
+    [[ -n $(list_codec_pins "$file" auto) ]] || continue
+    DEVICE_PATH="/dev/snd/hwC${CARD_INDEX}D${codec_address}"
+    CODEC_FILE=$file
+    return 0
+  done
+  print_error "aucun codec avec des haut-parleurs sur la carte $CARD"
+  return 1
+}
+
+resolve_codec() {
+  if [[ -n $DEVICE ]]; then
+    use_configured_device
+    return
+  fi
+  detect_codec_device
+}
+
+resolve_pins() {
+  PINS_AUTO=$(list_codec_pins "$CODEC_FILE" auto)
+  PINS_HINT=$(list_codec_pins "$CODEC_FILE" hints)
+  if [[ -n $SPEAKER_PINS ]]; then
+    PINS_SOURCE=config
+    read -r -a PINS <<< "${SPEAKER_PINS,,}"
+  else
+    PINS_SOURCE=auto
+    read -r -a PINS <<< "$PINS_AUTO"
+  fi
+  (( ${#PINS[@]} > 0 )) || { print_error "aucune broche de haut-parleur trouvée"; return 1; }
+}
+
+resolve_context() {
+  resolve_card_index || return 1
+  resolve_codec || return 1
+  resolve_pins
+}
+
+is_pin_enabled() {
+  local value=$1
+  (( value & PIN_OUT_ENABLE_BIT ))
+}
+
+read_pin_value() {
+  local pin=$1 output line
+  output=$(timeout "$HDA_VERB_TIMEOUT_SECONDS" hda-verb "$DEVICE_PATH" "$pin" GET_PIN_WIDGET_CONTROL 0 2>/dev/null) || {
+    print_error "lecture impossible de la broche $pin"
+    return 1
+  }
+  while IFS= read -r line; do
+    if [[ $line =~ ^value[[:space:]]*=[[:space:]]*(0x[0-9a-fA-F]{1,2})[[:space:]]*$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <<< "$output"
+  print_error "réponse inattendue de hda-verb pour la broche $pin"
+  return 1
+}
+
+write_pin_value() {
+  local pin=$1 value=$2
+  timeout "$HDA_VERB_TIMEOUT_SECONDS" hda-verb "$DEVICE_PATH" "$pin" SET_PIN_WIDGET_CONTROL "$value" >/dev/null 2>&1 || {
+    print_error "écriture impossible sur la broche $pin"
+    return 1
+  }
+}
+
+read_pin_values() {
+  local pin value
+  PIN_VALUES=()
+  for pin in "${PINS[@]}"; do
+    value=$(read_pin_value "$pin") || return 1
+    PIN_VALUES+=("$value")
+  done
+}
+
+count_enabled_pins() {
+  local value enabled_count=0
+  for value in "${PIN_VALUES[@]}"; do
+    if is_pin_enabled "$value"; then
+      enabled_count=$(( enabled_count + 1 ))
+    fi
+  done
+  printf '%s\n' "$enabled_count"
+}
+
+pins_all_muted() {
+  read_pin_values || return 1
+  [[ $(count_enabled_pins) == 0 ]]
+}
+
+read_hardware_mode() {
+  read_pin_values || return 1
+  classify_mode "$(count_enabled_pins)" "${#PINS[@]}"
+}
+
+classify_mode() {
+  local enabled_count=$1 total=$2
+  if (( enabled_count == total )); then
+    printf 'speakers\n'
+  elif (( enabled_count == 0 )); then
+    printf 'headphones\n'
+  else
+    printf 'mixed\n'
+  fi
+}
+
+read_power_save() {
+  [[ -r $POWER_SAVE_FILE ]] || return 1
+  local value
+  value=$(< "$POWER_SAVE_FILE")
+  [[ $value =~ $INTEGER_PATTERN ]] || return 1
+  printf '%s\n' "$value"
+}
+
+set_power_save() {
+  local value=$1
+  if [[ ! -w $POWER_SAVE_FILE ]]; then
+    log_message warning "power_save non modifiable : $POWER_SAVE_FILE"
+    return 0
+  fi
+  printf '%s\n' "$value" > "$POWER_SAVE_FILE"
+}
+
+mute_pins() {
+  local pin
+  for pin in "${PINS[@]}"; do
+    write_pin_value "$pin" "$PIN_MUTED_VALUE" || return 1
+  done
+}
+
+unmute_headphone() {
+  amixer -c "$CARD_INDEX" -q -- sset "$HEADPHONE_CONTROL" unmute 100% >/dev/null 2>&1 \
+    || log_message warning "contrôle $HEADPHONE_CONTROL impossible à réactiver"
+}
+
+apply_muting() {
+  set_power_save "$POWER_SAVE_DISABLED" || return 1
+  mute_pins || return 1
+  unmute_headphone
+}
+
+save_pin_value() {
+  local key="PIN_$1" value=$2
+  if is_pin_enabled "$value" || [[ -z ${STATE[$key]:-} ]]; then
+    STATE[$key]=$value
+  fi
+}
+
+save_pin_values() {
+  local pin value
+  for pin in "${PINS[@]}"; do
+    value=$(read_pin_value "$pin") || return 1
+    save_pin_value "$pin" "$value"
+  done
+}
+
+save_power_save() {
+  [[ -z ${STATE[POWER_SAVE]:-} ]] || return 0
+  local value
+  value=$(read_power_save) || return 0
+  STATE[POWER_SAVE]=$value
+}
+
+restore_unsaved_pin() {
+  local pin=$1 current_value
+  current_value=$(read_pin_value "$pin") || return 1
+  if is_pin_enabled "$current_value"; then
+    return 0
+  fi
+  log_message warning "valeur d'origine inconnue pour la broche $pin, repli sur $PIN_ENABLED_VALUE"
+  write_pin_value "$pin" "$PIN_ENABLED_VALUE"
+}
+
+restore_pin_values() {
+  local pin key
+  for pin in "${PINS[@]}"; do
+    key="PIN_$pin"
+    if [[ -z ${STATE[$key]:-} ]]; then
+      restore_unsaved_pin "$pin" || return 1
+      continue
+    fi
+    write_pin_value "$pin" "${STATE[$key]}" || return 1
+  done
+}
+
+restore_saved_power_save() {
+  [[ -n ${STATE[POWER_SAVE]:-} ]] || return 0
+  set_power_save "${STATE[POWER_SAVE]}"
+}
+
+commit_mode() {
+  local mode=$1
+  STATE=()
+  STATE[MODE]=$mode
+  write_state || return 1
+}
+
+verb_off() {
+  load_state
+  resolve_context || return 1
+  if ! pins_all_muted; then
+    save_pin_values || return 1
+    save_power_save
+  fi
+  apply_muting || return 1
+  pins_all_muted || { print_error "les haut-parleurs n'ont pas pu être coupés"; return 1; }
+  STATE[MODE]=headphones
+  write_state || return 1
+  printf 'mode=headphones\n'
+}
+
+verb_on() {
+  load_state
+  resolve_context || return 1
+  restore_pin_values || return 1
+  restore_saved_power_save || return 1
+  commit_mode speakers || return 1
+  printf 'mode=speakers\n'
+}
+
+verb_toggle() {
+  resolve_context || return 1
+  local hardware_mode
+  hardware_mode=$(read_hardware_mode) || return 1
+  if [[ $hardware_mode == headphones ]]; then
+    verb_on
+    return
+  fi
+  verb_off
+}
+
+restore_pins() {
+  load_state
+  [[ ${STATE[MODE]:-} == headphones ]] || return 0
+  resolve_context || return 1
+  local attempt
+  for (( attempt = 1; attempt <= RESTORE_ATTEMPTS; attempt++ )); do
+    apply_muting || log_message warning "restauration: tentative $attempt en échec"
+    if pins_all_muted; then
+      return 0
+    fi
+    sleep "$RESTORE_DELAY_SECONDS"
+  done
+  log_message err "restauration: broches toujours actives après $RESTORE_ATTEMPTS tentatives"
+  return 1
+}
+
+verb_restore() {
+  if ! (load_config && run_locked restore_pins); then
+    log_message err "restauration impossible"
+  fi
+  return 0
+}
+
+verb_alsa_init() {
+  resolve_card_index || return 1
+  local exit_code=0
+  alsactl init "$CARD_INDEX" >/dev/null 2>&1 || exit_code=$?
+  if (( exit_code != 0 && exit_code != ALSACTL_GENERIC_INIT_CODE )); then
+    log_message warning "alsactl init a échoué (code $exit_code)"
+  fi
+  restore_pins || log_message err "restauration impossible après alsa-init"
+  return 0
+}
+
+read_headphone_switch() {
+  local mixer_output
+  mixer_output=$(amixer -c "$CARD_INDEX" -- sget "$HEADPHONE_CONTROL" 2>/dev/null) || {
+    printf 'unknown\n'
+    return 0
+  }
+  if [[ $mixer_output =~ \[(on|off)\] ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf 'unknown\n'
+}
+
+print_pin_status() {
+  local index
+  for index in "${!PINS[@]}"; do
+    printf 'pin_%s=%s\n' "${PINS[$index]}" "${PIN_VALUES[$index]}"
+  done
+}
+
+verb_status() {
+  resolve_context || return 1
+  read_pin_values || return 1
+  printf 'mode=%s\n' "$(classify_mode "$(count_enabled_pins)" "${#PINS[@]}")"
+  printf 'card=%s\ncard_index=%s\ndevice=%s\n' "$CARD" "$CARD_INDEX" "$DEVICE_PATH"
+  printf 'codec=%s\n' "$(read_codec_name)"
+  printf 'pins=%s\npins_source=%s\npins_auto=%s\npins_hint=%s\n' "${PINS[*]}" "$PINS_SOURCE" "$PINS_AUTO" "$PINS_HINT"
+  print_pin_status
+  printf 'headphone_switch=%s\n' "$(read_headphone_switch)"
+  printf 'power_save=%s\n' "$(read_power_save || printf 'unknown')"
+}
+
+run_detect() {
+  local file=$1
+  [[ -f $file && -r $file ]] || die "fichier codec illisible : $file"
+  printf 'pins=%s\n' "$(list_codec_pins "$file" auto)"
+  printf 'hints=%s\n' "$(list_codec_pins "$file" hints)"
+}
+
+require_argument_count() {
+  local expected=$1 actual=$2
+  (( actual == expected )) || exit_usage
+}
+
+run_verb() {
+  local verb=$1
+  load_config
+  case "$verb" in
+    status) verb_status ;;
+    on) run_locked verb_on ;;
+    off) run_locked verb_off ;;
+    toggle) run_locked verb_toggle ;;
+    alsa-init) run_locked verb_alsa_init ;;
+  esac
+}
+
+main() {
+  local verb=${1:-}
+  case "$verb" in
+    -h|--help|help) print_usage ;;
+    detect) require_argument_count 2 "$#"; run_detect "$2" ;;
+    restore) require_argument_count 1 "$#"; require_root; verb_restore ;;
+    on|off|toggle|status|alsa-init) require_argument_count 1 "$#"; require_root; run_verb "$verb" ;;
+    *) exit_usage ;;
+  esac
+}
+
+main "$@"

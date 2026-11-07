@@ -1,0 +1,15 @@
+#!/bin/bash
+# jackless-sleep: systemd system-sleep hook. Re-applies the speaker mute after resume.
+set -euo pipefail
+
+readonly HELPER=/usr/local/bin/jackless-pin
+
+main() {
+  local phase=${1:-}
+  if [[ $phase == post ]]; then
+    "$HELPER" restore || true
+  fi
+  return 0
+}
+
+main "$@"
