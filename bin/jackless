@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# jackless: switch audio between speakers and headphones when the jack sensor is dead.
+set -euo pipefail
+
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+readonly SCRIPT_DIR
+# shellcheck source=lib/jackless/common.sh
+source "$SCRIPT_DIR/../lib/jackless/common.sh"
+
+readonly DIAGNOSE_HELPER="$SCRIPT_DIR/jackless-pin"
+readonly MIXER_UNMUTE_PERCENT=90
+readonly CAPTURE_PERCENT=80
+readonly SOURCE_VOLUME_PERCENT=80
+readonly PIPEWIRE_WAIT_ATTEMPTS=20
+readonly PIPEWIRE_WAIT_STEP_SECONDS=0.5
+readonly EXIT_USAGE=2
+readonly ANALOG_PROFILE='output:analog-stereo+input:analog-stereo'
+readonly INTERNAL_MIC_PORT=analog-input-internal-mic
+readonly -a RESET_MIXER_CONTROLS=(Master Speaker Headphone PCM)
+
+print_usage() {
+  cat <<'USAGE'
+Usage : jackless [commande]
+
+Commandes :
+  toggle               bascule casque / haut-parleurs (défaut)
+  headphones           force le mode casque
+  speakers             force le mode haut-parleurs
+  status               affiche l'état (mode, codec, broches, port PipeWire)
+  reset [--yes]        réinitialise l'audio (services, état WirePlumber, mixeur)
+  diagnose [--interactive]
+                       diagnostic avant installation (test du capteur de prise)
+  help, -h, --help     affiche cette aide
+USAGE
+}
+
+has_option() {
+  local wanted="$1" argument
+  shift
+  for argument in "$@"; do
+    if [[ $argument == "$wanted" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+reject_unknown_options() {
+  local allowed="$1" argument
+  shift
+  for argument in "$@"; do
+    if [[ $argument != "$allowed" ]]; then
+      print_error "option inconnue : $argument"
+      return 1
+    fi
+  done
+}
+
+announce_message() {
+  print_info "$1"
+  notify_user "$1"
+}
+
+announce_mode() {
+  parse_status_lines <<<"$1"
+  case "$(status_value mode)" in
+    headphones) announce_message "Casque" ;;
+    speakers) announce_message "Haut-parleurs" ;;
+    *)
+      print_error "réponse inattendue de jackless-pin : $1"
+      return 1
+      ;;
+  esac
+}
+
+command_toggle() {
+  local output
+  set_speaker_port
+  output="$(run_helper toggle)"
+  announce_mode "$output"
+}
+
+command_headphones() {
+  set_speaker_port
+  run_helper off >/dev/null
+  announce_message "Casque"
+}
+
+command_speakers() {
+  run_helper on >/dev/null
+  announce_message "Haut-parleurs"
+}
+
+translate_mode() {
+  case "$1" in
+    headphones) printf 'casque' ;;
+    speakers) printf 'haut-parleurs' ;;
+    mixed) printf 'mixte (broches incohérentes)' ;;
+    *) printf 'inconnu' ;;
+  esac
+}
+
+print_pin_states() {
+  local pin
+  local -a pins
+  read -r -a pins <<<"$(status_value pins)"
+  for pin in "${pins[@]}"; do
+    printf '  broche %s : pin-ctl %s\n' "$pin" "$(status_value "pin_$pin")"
+  done
+}
+
+print_helper_summary() {
+  printf 'Mode : %s\n' "$(translate_mode "$(status_value mode)")"
+  printf 'Carte : %s (index %s)\n' "$(status_value card)" "$(status_value card_index)"
+  printf 'Périphérique : %s\n' "$(status_value device)"
+  printf 'Codec : %s\n' "$(status_value codec)"
+  printf 'Broches effectives : %s (source : %s)\n' "$(status_value pins)" "$(status_value pins_source)"
+  printf 'Broches détectées automatiquement : %s\n' "$(status_value pins_auto)"
+  printf 'Broches candidates (hints) : %s\n' "$(status_value pins_hint)"
+  print_pin_states
+  printf 'Interrupteur %s : %s\n' "$HEADPHONE_CONTROL" "$(status_value headphone_switch)"
+  printf 'power_save : %s\n' "$(status_value power_save)"
+}
+
+print_sink_port() {
+  local sink port
+  if ! sink="$(resolve_sink_name)"; then
+    print_warning "sortie PipeWire introuvable"
+    return 0
+  fi
+  port="$(get_sink_active_port "$sink")"
+  printf 'Port actif PipeWire (%s) : %s\n' "$sink" "${port:-inconnu}"
+}
+
+command_status() {
+  local output
+  output="$(run_helper status)"
+  parse_status_lines <<<"$output"
+  print_helper_summary
+  print_sink_port
+}
+
+confirm_reset() {
+  local assume_yes="$1" answer
+  if [[ $assume_yes == yes || ! -t 0 ]]; then
+    return 0
+  fi
+  read -r -p "Réinitialiser l'audio (services PipeWire, état WirePlumber, mixeur) ? [o/N] " answer || return 1
+  case "${answer,,}" in
+    o | oui | y | yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_audio_services() {
+  systemctl --user stop wireplumber pipewire-pulse pipewire || print_warning "arrêt des services audio incomplet"
+}
+
+start_audio_services() {
+  systemctl --user start pipewire pipewire-pulse wireplumber || print_warning "démarrage des services audio incomplet"
+}
+
+backup_wireplumber_state() {
+  local state_dir="$HOME/.local/state/wireplumber" backup_dir
+  if [[ ! -d $state_dir ]]; then
+    return 0
+  fi
+  backup_dir="$state_dir.bak-$(date +%Y%m%d-%H%M%S)"
+  mv -- "$state_dir" "$backup_dir"
+  print_info "État WirePlumber sauvegardé : $backup_dir"
+}
+
+unmute_alsa_controls() {
+  local control
+  for control in "${RESET_MIXER_CONTROLS[@]}"; do
+    amixer -c "$CARD" -q sset "$control" unmute "${MIXER_UNMUTE_PERCENT}%" >/dev/null 2>&1 || true
+  done
+  amixer -c "$CARD" -q sset Capture cap "${CAPTURE_PERCENT}%" >/dev/null 2>&1 || true
+}
+
+wait_for_pipewire() {
+  local attempt
+  for ((attempt = 0; attempt < PIPEWIRE_WAIT_ATTEMPTS; attempt++)); do
+    if run_pactl info >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$PIPEWIRE_WAIT_STEP_SECONDS"
+  done
+  return 1
+}
+
+is_analog_sink() {
+  [[ $1 == alsa_output.*.analog-stereo ]]
+}
+
+derive_card_name() {
+  local base="${1#alsa_output.}"
+  printf 'alsa_card.%s\n' "${base%.analog-stereo}"
+}
+
+derive_source_name() {
+  local base="${1#alsa_output.}"
+  printf 'alsa_input.%s.analog-stereo\n' "${base%.analog-stereo}"
+}
+
+configure_pipewire_devices() {
+  local sink="$1" card source
+  if ! is_analog_sink "$sink"; then
+    print_warning "sortie non analogique ($sink), configuration PipeWire ignorée"
+    return 0
+  fi
+  card="$(derive_card_name "$sink")"
+  source="$(derive_source_name "$sink")"
+  try_pactl "profil de carte non appliqué ($card)" set-card-profile "$card" "$ANALOG_PROFILE"
+  try_pactl "sortie par défaut non appliquée" set-default-sink "$sink"
+  try_pactl "entrée par défaut non appliquée" set-default-source "$source"
+  try_pactl "port du micro non appliqué" set-source-port "$source" "$INTERNAL_MIC_PORT"
+  try_pactl "micro non réactivé" set-source-mute "$source" 0
+  try_pactl "volume du micro non appliqué" set-source-volume "$source" "${SOURCE_VOLUME_PERCENT}%"
+}
+
+print_microphone_recap() {
+  local source="$1" mute_line volume_line volume="inconnu"
+  if ! mute_line="$(run_pactl get-source-mute "$source" 2>/dev/null)"; then
+    print_warning "micro introuvable : $source"
+    return 0
+  fi
+  volume_line="$(run_pactl get-source-volume "$source" 2>/dev/null || true)"
+  if [[ $volume_line =~ ([0-9]+)% ]]; then
+    volume="${BASH_REMATCH[1]}%"
+  fi
+  case "${mute_line#Mute: }" in
+    no) printf 'Micro %s : actif, volume %s\n' "$source" "$volume" ;;
+    *) printf 'Micro %s : coupé, volume %s\n' "$source" "$volume" ;;
+  esac
+}
+
+restart_audio_stack() {
+  stop_audio_services
+  backup_wireplumber_state
+  run_helper alsa-init >/dev/null || print_warning "initialisation ALSA ignorée"
+  unmute_alsa_controls
+  start_audio_services
+  if ! wait_for_pipewire; then
+    print_warning "PipeWire ne répond pas après ${PIPEWIRE_WAIT_ATTEMPTS} essais"
+  fi
+}
+
+restore_headphone_mode() {
+  run_helper restore >/dev/null || print_warning "restauration du mode casque ignorée"
+}
+
+command_reset() {
+  local assume_yes=no sink
+  if has_option --yes "$@"; then
+    assume_yes=yes
+  fi
+  if ! confirm_reset "$assume_yes"; then
+    print_info "Annulé."
+    return 0
+  fi
+  restart_audio_stack
+  if ! sink="$(resolve_sink_name)"; then
+    print_warning "sortie PipeWire introuvable"
+    restore_headphone_mode
+    return 0
+  fi
+  configure_pipewire_devices "$sink"
+  restore_headphone_mode
+  print_microphone_recap "$(derive_source_name "$sink")"
+}
+
+wait_for_enter() {
+  read -r -p "$1" || true
+}
+
+capture_jack_sensor() {
+  sudo hdajacksensetest -a
+}
+
+list_changed_presence() {
+  diff --unchanged-line-format= --old-line-format= --new-line-format='%L' \
+    <(grep 'present =' <<<"$1" || true) <(grep 'present =' <<<"$2" || true) || true
+}
+
+show_presence_diff() {
+  diff -u <(grep 'present =' <<<"$1" || true) <(grep 'present =' <<<"$2" || true) || true
+}
+
+run_jack_sensor_test() {
+  local before after changed
+  wait_for_enter "Branche le casque puis appuie sur Entrée "
+  before="$(capture_jack_sensor)"
+  wait_for_enter "Débranche le casque puis appuie sur Entrée "
+  after="$(capture_jack_sensor)"
+  show_presence_diff "$before" "$after"
+  changed="$(list_changed_presence "$before" "$after")"
+  if [[ -z $changed ]]; then
+    print_info "capteur de prise HS : aucune broche ne change, jackless est fait pour toi"
+    return 0
+  fi
+  print_info "Le capteur de prise fonctionne, broche(s) modifiée(s) :"
+  print_info "$changed"
+  print_info "jackless n'est probablement pas nécessaire."
+}
+
+suggest_hint_pins() {
+  local hints
+  hints="$(status_value pins_hint)"
+  if [[ -z $hints ]]; then
+    return 0
+  fi
+  print_info "Broches candidates : $hints"
+  print_info "Si les haut-parleurs ne se coupent pas, teste-les dans SPEAKER_PINS (/etc/jackless.conf)."
+}
+
+print_mixer_controls() {
+  print_info "Contrôles ALSA (carte $CARD) :"
+  amixer -c "$CARD" scontrols || print_warning "amixer a échoué pour la carte $CARD"
+}
+
+print_sink_ports() {
+  local sink
+  if ! sink="$(resolve_sink_name)"; then
+    print_warning "sortie PipeWire introuvable"
+    return 0
+  fi
+  print_info "Ports PipeWire de $sink :"
+  get_sink_ports_section "$sink"
+}
+
+command_diagnose() {
+  local output
+  if [[ ! -x $DIAGNOSE_HELPER ]]; then
+    print_error "assistant introuvable : $DIAGNOSE_HELPER"
+    return 1
+  fi
+  print_info "Diagnostic (le mot de passe sudo peut être demandé)"
+  output="$(sudo "$DIAGNOSE_HELPER" status)"
+  parse_status_lines <<<"$output"
+  print_helper_summary
+  suggest_hint_pins
+  print_mixer_controls
+  print_sink_ports
+  if has_option --interactive "$@"; then
+    run_jack_sensor_test
+  fi
+}
+
+allowed_option_for() {
+  case "$1" in
+    reset) printf '%s' --yes ;;
+    diagnose) printf '%s' --interactive ;;
+    *) printf '' ;;
+  esac
+}
+
+run_subcommand() {
+  local subcommand="$1"
+  shift
+  reject_unknown_options "$(allowed_option_for "$subcommand")" "$@" || return "$EXIT_USAGE"
+  load_config || return 1
+  "command_$subcommand" "$@"
+}
+
+main() {
+  local subcommand="${1:-toggle}"
+  if (($# > 0)); then
+    shift
+  fi
+  case "$subcommand" in
+    --help | -h | help) print_usage ;;
+    toggle | headphones | speakers | status | reset | diagnose) run_subcommand "$subcommand" "$@" ;;
+    *)
+      print_error "sous-commande inconnue : $subcommand"
+      print_usage >&2
+      return "$EXIT_USAGE"
+      ;;
+  esac
+}
+
+main "$@"
