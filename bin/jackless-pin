@@ -410,9 +410,17 @@ mute_pins() {
   done
 }
 
+# The driver skips writes matching its register cache, and after resume the cache
+# can say "unmuted" while the codec amp is muted: muting first forces a real write.
 unmute_headphone() {
-  amixer -c "$CARD_INDEX" -q -- sset "$HEADPHONE_CONTROL" unmute 100% >/dev/null 2>&1 \
-    || log_message warning "contrôle $HEADPHONE_CONTROL impossible à réactiver"
+  if set_headphone_control mute && set_headphone_control unmute 100%; then
+    return 0
+  fi
+  log_message warning "contrôle $HEADPHONE_CONTROL impossible à réactiver"
+}
+
+set_headphone_control() {
+  amixer -c "$CARD_INDEX" -q -- sset "$HEADPHONE_CONTROL" "$@" >/dev/null 2>&1
 }
 
 apply_muting() {

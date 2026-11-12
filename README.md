@@ -87,6 +87,7 @@ Trois approches qui ne marchent pas, testées :
 Autres pièges :
 
 - WirePlumber réapplique à chaque redémarrage de PipeWire, ouverture de session ou changement de port le profil `analog-output-speaker.conf`, qui contient `[Element Headphone] switch = off`. Le contrôle `Headphone` est donc remis à zéro ; l'assistant le réactive à chaque `headphones`, au réveil et via `reset`.
+- Après une veille, l'ampli de la broche casque peut rester coupé au niveau matériel alors qu'`amixer` affiche `Headphone [on]` : le pilote ignore une écriture identique à son cache. L'assistant coupe puis réactive le contrôle pour forcer l'écriture.
 - `power_save` de `snd_hda_intel` remet les broches à leur état d'origine quand le codec s'endort. Le mode casque force `power_save` à 0 et restaure la valeur d'origine au retour en haut-parleurs.
 - Un ancien script dans `~/.local/bin` passe avant `/usr/local/bin` dans le `PATH` et masque la commande installée. `just install` détecte et sauvegarde les anciens fichiers connus : ceux du système dans `/var/backups/jackless/` (root uniquement), ceux de ton dossier personnel dans `~/.local/share/jackless/legacy/`. Si une autre commande `jackless` précède l'installée dans le `PATH`, il te l'indique sans la supprimer.
 
