@@ -249,7 +249,7 @@ list_codec_pins() {
 }
 
 read_codec_name() {
-  awk -F': ' '/^Codec:/ { print $2; exit }' -- "$CODEC_FILE"
+  awk -F': ' -- '/^Codec:/ { print $2; exit }' "$CODEC_FILE"
 }
 
 resolve_card_index() {
